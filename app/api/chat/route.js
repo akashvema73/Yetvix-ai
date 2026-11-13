@@ -23,24 +23,43 @@ function cleanAttachments(list) {
   });
 }
 
-// OpenAI-compatible format (Groq / OpenRouter / OpenAI)
-function toMessage(role, content, atts, withMedia) {
+const fileNote = (a) => `\n\n[Attached file: ${a.name}]\n\`\`\`\n${a.text}\n\`\`\``;
+
+// Claude (Anthropic) message format
+function toClaude(role, content, atts, withMedia) {
   let text = content;
+  const blocks = [];
+  for (const a of atts || []) {
+    if (a.type === "text") text += fileNote(a);
+    else if (withMedia && a.type === "image")
+      blocks.push({ type: "image", source: { type: "base64", media_type: a.mediaType, data: a.data } });
+    else if (withMedia && a.type === "pdf" && a.data)
+      blocks.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: a.data } });
+  }
+  return { role, content: blocks.length ? [...blocks, { type: "text", text }] : text };
+}
+
+// OpenAI-compatible format (Groq etc.)
+function toOpenAI(role, content, atts, withMedia, cap) {
+  let text = cap && content.length > 6000 ? content.slice(0, 6000) + "\n...[lamba message chhota kiya gaya]" : content;
   const images = [];
   for (const a of atts || []) {
-    if (a.type === "text") text += `\n\n[Attached file: ${a.name}]\n\`\`\`\n${a.text}\n\`\`\``;
-    else if (a.type === "pdf") text += `\n\n[PDF "${a.name}" attached, lekin ye model PDF nahi padh sakta. User ko text copy-paste karne ko bolo.]`;
+    if (a.type === "text") text += fileNote(cap && a.text.length > 8000 ? { ...a, text: a.text.slice(0, 8000) + "\n...[file ka baaki hissa chhoda gaya]" } : a);
+    else if (a.type === "pdf") text += `\n\n[PDF "${a.name}" attached, lekin ye model PDF nahi padh sakta.]`;
     else if (withMedia && a.type === "image") images.push({ type: "image_url", image_url: { url: `data:${a.mediaType};base64,${a.data}` } });
   }
-  if (images.length) return { role, content: [{ type: "text", text }, ...images], hasImage: true };
-  return { role, content: text };
+  return { role, content: images.length ? [{ type: "text", text }, ...images] : text };
 }
 
 export async function POST(req) {
   try {
-    const apiKey = process.env.AI_API_KEY || process.env.GROQ_API_KEY;
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    const openaiKey = process.env.AI_API_KEY || process.env.GROQ_API_KEY;
+    let provider = (process.env.AI_PROVIDER || "").toLowerCase();
+    if (provider !== "anthropic" && provider !== "openai") provider = anthropicKey && !anthropicKey.startsWith("your-") ? "anthropic" : "openai";
+    const apiKey = provider === "anthropic" ? anthropicKey : openaiKey;
     if (!apiKey || apiKey.startsWith("your-"))
-      return json({ error: "Server par AI_API_KEY set nahi hai. .env.local file mein apni Groq key daalo." }, 500);
+      return json({ error: provider === "anthropic" ? "Server par ANTHROPIC_API_KEY set nahi hai. .env.local mein apni Claude API key daalo." : "Server par AI_API_KEY set nahi hai." }, 500);
 
     const token = (req.headers.get("authorization") || "").replace("Bearer ", "").trim();
     if (!token) return json({ error: "Login zaroori hai." }, 401);
@@ -57,15 +76,17 @@ export async function POST(req) {
     const tools = body.tools || {};
     let conversationId = body.conversationId || null;
     if (!regenerate && !text) return json({ error: "Message khaali hai." }, 400);
-    if (text.length > 8000) return json({ error: "Message bahut lamba hai (max 8000 characters)." }, 400);
+    if (text.length > 50000) return json({ error: "Message bahut lamba hai (max 50000 characters)." }, 400);
 
-    // Daily limit
-    const limit = parseInt(process.env.DAILY_MESSAGE_LIMIT || "50", 10);
-    const start = new Date();
-    start.setUTCHours(0, 0, 0, 0);
-    const { count } = await sb.from("messages").select("id", { count: "exact", head: true })
-      .eq("user_id", user.id).eq("role", "user").gte("created_at", start.toISOString());
-    if ((count || 0) >= limit) return json({ error: `Aaj ki limit (${limit} messages) poori ho gayi. Kal dobara try karo.` }, 429);
+    // Daily limit (optional): DAILY_MESSAGE_LIMIT=0 ya khaali = koi limit nahi
+    const limit = parseInt(process.env.DAILY_MESSAGE_LIMIT || "0", 10);
+    if (limit > 0) {
+      const start = new Date();
+      start.setUTCHours(0, 0, 0, 0);
+      const { count } = await sb.from("messages").select("id", { count: "exact", head: true })
+        .eq("user_id", user.id).eq("role", "user").gte("created_at", start.toISOString());
+      if ((count || 0) >= limit) return json({ error: `Aaj ki limit (${limit} messages) poori ho gayi. Kal dobara try karo.` }, 429);
+    }
 
     // Conversation (sirf apni)
     if (conversationId) {
@@ -96,33 +117,67 @@ export async function POST(req) {
       .eq("conversation_id", conversationId).order("created_at", { ascending: false }).limit(30);
     const ordered = (rows || []).reverse();
     while (ordered.length && ordered[0].role !== "user") ordered.shift();
-    const history = ordered.map((m, i) => {
-      const isLast = i === ordered.length - 1;
-      const a = isLast && !regenerate ? atts : m.attachments;
-      return toMessage(m.role, m.content, a, isLast);
-    });
-    if (!history.length) return json({ error: "Koi message nahi mila." }, 400);
-    const hasImage = history.some((m) => m.hasImage);
-    const messages = history.map(({ role, content }) => ({ role, content }));
+    const build = provider === "anthropic" ? toClaude : toOpenAI;
+    // Levels: pehle poori history; provider "request too large" (413) bole toh khud chhota karke dobara
+    const LEVELS = provider === "anthropic"
+      ? [{ m: 30, c: Infinity, t: 4096 }]
+      : [{ m: 30, c: Infinity, t: 4096 }, { m: 12, c: 16000, t: 2000 }, { m: 6, c: 8000, t: 1500 }, { m: 2, c: 4000, t: 1000 }];
+    const size = (m) => (m.content || "").length + (m.attachments || []).reduce((n, a) => n + (a.text ? a.text.length : 0), 0);
+    const makeMessages = (lv) => {
+      const L = LEVELS[lv];
+      const arr = ordered.slice(-L.m);
+      let total = arr.reduce((n, m) => n + size(m), 0);
+      while (arr.length > 1 && total > L.c) total -= size(arr.shift());
+      while (arr.length && arr[0].role !== "user") arr.shift();
+      return arr.map((m, i) => {
+        const isLast = i === arr.length - 1;
+        const a = isLast && !regenerate ? atts : m.attachments;
+        return build(m.role, m.content, a, isLast, lv > 0);
+      });
+    };
+    let level = 0;
+    let messages = makeMessages(0);
+    if (!messages.length) return json({ error: "Koi message nahi mila." }, 400);
 
     let system = MODES[mode].system + BASE_RULES;
-    if (tools.deep || tools.search) system += " Tumhare paas live internet access nahi hai. Agar user taaza jaankari maange toh batao ki tumhari knowledge purani ho sakti hai.";
+    const useSearch = !!(tools.search || tools.deep);
+    if (provider === "anthropic") {
+      if (tools.deep) system += TOOL_RULES.deep;
+      else if (tools.search) system += TOOL_RULES.search;
+    } else if (useSearch) {
+      system += " Tumhare paas live internet access nahi hai. Agar user taaza jaankari maange toh batao ki tumhari knowledge purani ho sakti hai.";
+    }
     if (tools.image) system += TOOL_RULES.image;
     const custom = String(body.instructions || "").trim().slice(0, 1500);
     if (custom) system += `\n\nUser ki custom instructions (inhe follow karo):\n${custom}`;
 
-    const base = (process.env.AI_BASE_URL || "https://api.groq.com/openai/v1").replace(/\/$/, "");
-    const model = hasImage
-      ? process.env.AI_VISION_MODEL || "meta-llama/llama-4-scout-17b-16e-instruct"
-      : process.env.AI_MODEL || "llama-3.3-70b-versatile";
-    const url = `${base}/chat/completions`;
     const ctrl = new AbortController();
-    const buildBody = () => ({
-      model,
-      stream: true,
-      max_tokens: 4096,
-      messages: [{ role: "system", content: system }, ...messages],
-    });
+    const wantThink = provider === "anthropic" && !!tools.think;
+
+    // ---- request builder
+    let url, headers, buildBody;
+    if (provider === "anthropic") {
+      url = "https://api.anthropic.com/v1/messages";
+      headers = { "Content-Type": "application/json", "x-api-key": apiKey, "anthropic-version": "2023-06-01" };
+      const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
+      buildBody = (think) => {
+        const b = { model, stream: true, max_tokens: think || tools.deep ? 10000 : 4096, system, messages };
+        if (useSearch) b.tools = [{ type: "web_search_20250305", name: "web_search", max_uses: tools.deep ? 10 : 3 }];
+        if (think) b.thinking = { type: "enabled", budget_tokens: 4000 };
+        return b;
+      };
+    } else {
+      const base = (process.env.AI_BASE_URL || "https://api.groq.com/openai/v1").replace(/\/$/, "");
+      url = `${base}/chat/completions`;
+      headers = { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` };
+      const modelFor = () => (messages.some((m) => Array.isArray(m.content)) ? process.env.AI_VISION_MODEL || process.env.AI_MODEL || "openai/gpt-oss-20b" : process.env.AI_MODEL || "openai/gpt-oss-20b");
+      buildBody = () => {
+        const model = modelFor();
+        const b = { model, stream: true, max_tokens: parseInt(process.env.AI_MAX_TOKENS || "0", 10) || LEVELS[level].t, messages: [{ role: "system", content: system }, ...messages] };
+        if (model.startsWith("openai/gpt-oss")) b.reasoning_effort = "low"; // tez aur kam tokens
+        return b;
+      };
+    }
 
     const encoder = new TextEncoder();
     let full = "";
@@ -136,44 +191,71 @@ export async function POST(req) {
 
     const readable = new ReadableStream({
       async start(controller) {
+        const emit = (t) => { full += t; controller.enqueue(encoder.encode(t)); };
         try {
-          let res;
-          for (let attempt = 0; attempt < 4; attempt++) {
-            res = await fetch(url, {
-              method: "POST", signal: ctrl.signal,
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-              body: JSON.stringify(buildBody()),
-            });
-            // Server busy (500/503) ho toh thodi der ruk ke dobara try karo
-            if (![500, 503].includes(res.status) || attempt === 3) break;
-            await res.text().catch(() => {});
-            await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
-          }
-          if (!res.ok) {
-            const errText = await res.text();
-            let msg = errText;
-            try { msg = JSON.parse(errText).error?.message || errText; } catch {}
-            throw new Error(`${res.status}: ${msg}`);
-          }
-          const reader = res.body.getReader();
-          const dec = new TextDecoder();
-          let buf = "";
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += dec.decode(value, { stream: true });
-            const lines = buf.split("\n");
-            buf = lines.pop();
-            for (const line of lines) {
-              if (!line.startsWith("data:")) continue;
-              const payload = line.slice(5).trim();
-              if (!payload || payload === "[DONE]") continue;
-              let ev; try { ev = JSON.parse(payload); } catch { continue; }
-              const t = ev.choices?.[0]?.delta?.content;
-              if (t) { full += t; controller.enqueue(encoder.encode(t)); }
+          for (const think of wantThink ? [true, false] : [false]) {
+            let res;
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            const waitSecs = async (r) => {
+              const h = parseFloat(r.headers.get("retry-after"));
+              if (!isNaN(h)) return h;
+              const t = await r.clone().text().catch(() => "");
+              const m = /try again in ([\d.]+)(ms|s)\b/i.exec(t);
+              return m ? (m[2].toLowerCase() === "ms" ? parseFloat(m[1]) / 1000 : parseFloat(m[1])) : null;
+            };
+            for (let attempt = 0; attempt < 8; attempt++) {
+              res = await fetch(url, { method: "POST", signal: ctrl.signal, headers, body: JSON.stringify(buildBody(think)) });
+              if (res.status === 413 && level < LEVELS.length - 1) { // request bahut badi: chhoti karke dobara
+                await res.text().catch(() => {});
+                level++; messages = makeMessages(level);
+                continue;
+              }
+              if (res.status === 429) { // thodi der ki limit ho toh ruk kar dobara
+                const w = await waitSecs(res);
+                if (w !== null && w <= 20 && attempt < 7) { await res.text().catch(() => {}); await sleep(w * 1000 + 300); continue; }
+                break;
+              }
+              if ([500, 503, 529].includes(res.status) && attempt < 7) { // server busy
+                await res.text().catch(() => {});
+                await sleep(1500 * (attempt + 1));
+                continue;
+              }
+              break;
             }
+            if (!res.ok) {
+              const errText = await res.text();
+              if (think && res.status === 400) continue; // thinking support na ho toh bina thinking ke dobara
+              let msg = errText;
+              try { const j = JSON.parse(errText); msg = j.error?.message || errText; } catch {}
+              throw new Error(`${res.status}: ${msg}`);
+            }
+            const reader = res.body.getReader();
+            const dec = new TextDecoder();
+            let buf = "";
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buf += dec.decode(value, { stream: true });
+              const lines = buf.split("\n");
+              buf = lines.pop();
+              for (const line of lines) {
+                if (!line.startsWith("data:")) continue;
+                const payload = line.slice(5).trim();
+                if (!payload || payload === "[DONE]") continue;
+                let ev; try { ev = JSON.parse(payload); } catch { continue; }
+                if (provider === "anthropic") {
+                  if (ev.type === "content_block_start" && ev.content_block?.type === "text" && full && !/\s$/.test(full)) emit("\n\n");
+                  else if (ev.type === "content_block_delta" && ev.delta?.type === "text_delta") emit(ev.delta.text);
+                  else if (ev.type === "error") throw new Error(ev.error?.message || "Claude error");
+                } else {
+                  const t = ev.choices?.[0]?.delta?.content;
+                  if (t) emit(t);
+                }
+              }
+            }
+            if (!full) emit("\n\n**Error:** Khaali jawab aaya. Dobara try karo.");
+            break;
           }
-          if (!full) controller.enqueue(encoder.encode("\n\n**Error:** Khaali jawab aaya. Dobara try karo."));
           await save();
         } catch (e) {
           if (e?.name !== "AbortError") controller.enqueue(encoder.encode("\n\n**Error:** AI se jawab nahi aa paya. " + (e?.message || "")));
